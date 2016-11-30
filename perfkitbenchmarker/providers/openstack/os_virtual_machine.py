@@ -204,7 +204,7 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
       self._CheckFloatingIPNetworkExists()
 
   def _CheckFloatingIPNetworkExists(self):
-    cmd = os_utils.OpenStackCLICommand(self, 'ip', 'floating', 'pool', 'list')
+    cmd = os_utils.OpenStackCLICommand(self, 'network', 'list')
     stdout, stderr, _ = cmd.Issue()
     resp = json.loads(stdout)
     for flip_pool in resp:
