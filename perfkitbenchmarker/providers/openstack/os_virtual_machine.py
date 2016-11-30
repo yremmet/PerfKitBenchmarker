@@ -375,7 +375,7 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
     disks_names = ('%s_data_%d_%d'
                    % (self.name, len(self.scratch_disks), i)
                    for i in range(disk_spec.num_striped_disks))
-    disks = [os_disk.OpenStackDisk(disk_spec, name, self.zone)
+    disks = [os_disk.OpenStackDisk(disk_spec, name, 'nova')
              for name in disks_names]
 
     self._CreateScratchDiskFromDisks(disk_spec, disks)
