@@ -328,7 +328,7 @@ def _CreateBenchmarkSpecs():
     if check_prereqs:
       try:
         with config.RedirectFlags(FLAGS):
-          check_prereqs()
+          check_prereqs(config)
       except:
         logging.exception('Prerequisite check failed for %s', name)
         raise
@@ -350,6 +350,7 @@ def DoProvisionPhase(spec, timer):
   logging.info('Provisioning resources for benchmark %s', spec.name)
   # spark service needs to go first, because it adds some vms.
   spec.ConstructSparkService()
+  spec.ConstructDpbService()
   spec.ConstructVirtualMachines()
   # Pickle the spec before we try to create anything so we can clean
   # everything up on a second run if something goes wrong.
@@ -558,7 +559,8 @@ def RunBenchmarkTask(spec):
 
 def _LogCommandLineFlags():
   result = []
-  for flag in FLAGS.FlagDict().values():
+  for name in FLAGS:
+    flag = FLAGS[name]
     if flag.present:
       result.append(flag.Serialize())
   logging.info('Flag values:\n%s', '\n'.join(result))
