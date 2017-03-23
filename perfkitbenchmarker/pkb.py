@@ -60,6 +60,7 @@ import getpass
 import itertools
 import logging
 import multiprocessing
+import re
 import sys
 import time
 import uuid
@@ -120,7 +121,7 @@ flags.DEFINE_list(
     'Zones that will be appended to the "zones" list. This is functionally '
     'the same, but allows flag matrices to have two zone axes.')
 # TODO(user): note that this is currently very GCE specific. Need to create a
-#    module which can traslate from some generic types to provider specific
+#    module which can translate from some generic types to provider specific
 #    nomenclature.
 flags.DEFINE_string('machine_type', None, 'Machine '
                     'types that will be created for benchmarks that don\'t '
@@ -136,10 +137,10 @@ flags.DEFINE_string('owner', getpass.getuser(), 'Owner name. '
                     'Used to tag created resources and performance records.')
 flags.DEFINE_enum(
     'log_level', log_util.INFO,
-    [log_util.DEBUG, log_util.INFO],
+    log_util.LOG_LEVELS.keys(),
     'The log level to run at.')
 flags.DEFINE_enum(
-    'file_log_level', log_util.DEBUG, [log_util.DEBUG, log_util.INFO],
+    'file_log_level', log_util.DEBUG, log_util.LOG_LEVELS.keys(),
     'Anything logged at this level or higher will be written to the log file.')
 flags.DEFINE_integer('duration_in_seconds', None,
                      'duration of benchmarks. '
@@ -213,7 +214,9 @@ flags.DEFINE_integer(
     'run_processes', 1,
     'The number of parallel processes to use to run benchmarks.',
     lower_bound=1)
-
+flags.DEFINE_string(
+    'helpmatch', '',
+    'Shows only flags defined in a module whose name matches the given regex.')
 
 # Support for using a proxy in the cloud environment.
 flags.DEFINE_string('http_proxy', '',
@@ -260,8 +263,28 @@ def _ParseFlags(argv=sys.argv):
   try:
     argv = FLAGS(argv)
   except flags.FlagsError as e:
-    logging.error('%s\nUsage: %s ARGS\n%s', e, sys.argv[0], FLAGS)
+    logging.error(e)
+    logging.info('For usage instructions, use --helpmatch={module_name}')
+    logging.info('For example, ./pkb.py --helpmatch=benchmarks.fio')
     sys.exit(1)
+
+
+def _PrintHelp(matches=None):
+  """Prints help for flags defined in matching modules.
+
+  Args:
+    matches regex string or None. Filters help to only those whose name
+      matched the regex. If None then all flags are printed.
+  """
+  if not matches:
+    print FLAGS
+  else:
+    flags_by_module = FLAGS.FlagsByModuleDict()
+    modules = sorted(flags_by_module)
+    regex = re.compile(matches)
+    for module_name in modules:
+      if regex.search(module_name):
+        print FLAGS.ModuleHelp(module_name)
 
 
 def CheckVersionFlag():
@@ -328,7 +351,7 @@ def _CreateBenchmarkSpecs():
     if check_prereqs:
       try:
         with config.RedirectFlags(FLAGS):
-          check_prereqs()
+          check_prereqs(config)
       except:
         logging.exception('Prerequisite check failed for %s', name)
         raise
@@ -350,6 +373,7 @@ def DoProvisionPhase(spec, timer):
   logging.info('Provisioning resources for benchmark %s', spec.name)
   # spark service needs to go first, because it adds some vms.
   spec.ConstructSparkService()
+  spec.ConstructDpbService()
   spec.ConstructVirtualMachines()
   # Pickle the spec before we try to create anything so we can clean
   # everything up on a second run if something goes wrong.
@@ -558,7 +582,8 @@ def RunBenchmarkTask(spec):
 
 def _LogCommandLineFlags():
   result = []
-  for flag in FLAGS.FlagDict().values():
+  for name in FLAGS:
+    flag = FLAGS[name]
     if flag.present:
       result.append(flag.Serialize())
   logging.info('Flag values:\n%s', '\n'.join(result))
@@ -693,6 +718,9 @@ def Main():
   log_util.ConfigureBasicLogging()
   _InjectBenchmarkInfoIntoDocumentation()
   _ParseFlags()
+  if FLAGS.helpmatch:
+    _PrintHelp(FLAGS.helpmatch)
+    return 0
   CheckVersionFlag()
   SetUpPKB()
   return RunBenchmarks()

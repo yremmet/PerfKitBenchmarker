@@ -1,4 +1,4 @@
-# Copyright 2014 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2016 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,6 +49,7 @@ from perfkitbenchmarker import flags
 from perfkitbenchmarker import flag_util
 from perfkitbenchmarker import object_storage_service
 from perfkitbenchmarker import sample
+from perfkitbenchmarker import temp_dir
 from perfkitbenchmarker import units
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.gcp import gcs
@@ -70,7 +71,8 @@ flags.DEFINE_string('object_storage_storage_class', None,
 
 flags.DEFINE_enum('object_storage_scenario', 'all',
                   ['all', 'cli', 'api_data', 'api_namespace',
-                   'api_multistream', 'api_multistream_writes'],
+                   'api_multistream', 'api_multistream_writes',
+                   'api_multistream_reads'],
                   'select all, or one particular scenario to run: \n'
                   'ALL: runs all scenarios. This is the default. \n'
                   'cli: runs the command line only scenario. \n'
@@ -81,6 +83,9 @@ flags.DEFINE_enum('object_storage_scenario', 'all',
                   'upload/download streams.\n'
                   'api_multistream_writes: runs API-based benchmarking with '
                   'multiple upload streams.')
+
+flags.DEFINE_string('object_storage_bucket_name', None,
+                    'If set, the bucket will be created with this name')
 
 flags.DEFINE_enum('cli_test_size', 'normal',
                   ['normal', 'large'],
@@ -120,7 +125,34 @@ flags.DEFINE_enum('object_storage_object_naming_scheme', 'sequential_by_stream',
                   'different name prefixes. '
                   'approximately_sequential: object names from all '
                   'streams will roughly increase together.')
+flags.DEFINE_string('object_storage_objects_written_file', None,
+                    'If specified, the bucket and all of the objects will not '
+                    'be deleted, and the list of object names will be written '
+                    'to the specified file in the following format: '
+                    '<bucket>/<object>. This file can be passed to this '
+                    'benchmark in a later run via via the '
+                    'object_storage_read_objects flag. Only valid for the '
+                    'api_multistream and api_multistream_writes scenarios.')
+flags.DEFINE_string('object_storage_read_objects', None,
+                    'If specified, no new bucket or objects will be created. '
+                    'Instead, the benchmark will read the objects listed in '
+                    'the specified file. Only valid for the '
+                    'api_multistream_reads scenario.')
+flags.DEFINE_boolean('object_storage_dont_delete_bucket', False,
+                     'If True, the storage bucket won\'t be deleted. Useful '
+                     'for running the api_multistream_reads scenario multiple '
+                     'times against the same objects.')
 
+flags.DEFINE_string('object_storage_worker_output', None,
+                    'If set, the worker threads\' output will be written to the'
+                    'path provided.')
+flags.DEFINE_float('object_storage_latency_histogram_interval', None,
+                   'If set, a latency histogram sample will be created with '
+                   'buckets of the specified interval in seconds. Individual '
+                   'histogram samples are created for each different object '
+                   'size in the distribution, because it is easy to aggregate '
+                   'the histograms during post-processing, but impossible to '
+                   'go in the opposite direction.')
 
 FLAGS = flags.FLAGS
 
@@ -143,6 +175,8 @@ object_storage_service:
     default:
       vm_spec: *default_single_core
       vm_count: null
+  flags:
+    gcloud_scopes: https://www.googleapis.com/auth/devstorage.read_write
 """
 
 DATA_FILE = 'cloud-storage-workload.sh'
@@ -336,6 +370,7 @@ def _ProcessMultiStreamResults(start_times, latencies, sizes, operation,
   metadata['num_streams'] = num_streams
   metadata['objects_per_stream'] = (
       FLAGS.object_storage_multistream_objects_per_stream)
+  metadata['object_naming'] = FLAGS.object_storage_object_naming_scheme
 
   num_records = sum((len(start_time) for start_time in start_times))
   logging.info('Processing %s total operation records', num_records)
@@ -396,7 +431,10 @@ def _ProcessMultiStreamResults(start_times, latencies, sizes, operation,
   # searching metadata is easier when all records with the same metric
   # name have the same set of metadata fields.
   distribution_metadata = metadata.copy()
-  distribution_metadata['object_size_B'] = 'distribution'
+  if len(all_sizes) == 1:
+    distribution_metadata['object_size_B'] = all_sizes[0]
+  else:
+    distribution_metadata['object_size_B'] = 'distribution'
 
   latency_prefix = 'Multi-stream %s latency' % operation
   logging.info('Processing %s multi-stream %s results for the full '
@@ -422,6 +460,26 @@ def _ProcessMultiStreamResults(start_times, latencies, sizes, operation,
         latency_prefix,
         LATENCY_UNIT,
         this_size_metadata)
+    # Build the object latency histogram if user requested it
+    if FLAGS.object_storage_latency_histogram_interval:
+      histogram_interval = FLAGS.object_storage_latency_histogram_interval
+      hist_latencies = [[l for l, s in zip(*w_l_s) if s == size]
+                        for w_l_s in zip(latencies, sizes)]
+      max_latency = max([max(l) for l in hist_latencies])
+      # Note that int() floors for us
+      num_histogram_buckets = int(max_latency / histogram_interval) + 1
+      histogram_buckets = [0 for _ in range(num_histogram_buckets)]
+      for worker_latencies in hist_latencies:
+        for latency in worker_latencies:
+          # Note that int() floors for us
+          histogram_buckets[int(latency / histogram_interval)] += 1
+      histogram_str = ','.join([str(c) for c in histogram_buckets])
+      histogram_metadata = this_size_metadata.copy()
+      histogram_metadata['interval'] = histogram_interval
+      histogram_metadata['histogram'] = histogram_str
+      results.append(sample.Sample(
+          'Multi-stream %s latency histogram' % operation,
+          0.0, 'histogram', metadata=histogram_metadata))
 
   # Throughput metrics
   total_active_times = [np.sum(latency) for latency in active_latencies]
@@ -572,7 +630,7 @@ class UnsupportedProviderCommandBuilder(APIScriptCommandBuilder):
 
 
 def OneByteRWBenchmark(results, metadata, vm, command_builder,
-                       service, bucket_name, regional_bucket_name):
+                       service, bucket_name):
   """A benchmark for small object latency.
 
   Args:
@@ -582,45 +640,37 @@ def OneByteRWBenchmark(results, metadata, vm, command_builder,
     command_builder: an APIScriptCommandBuilder.
     service: an ObjectStorageService.
     bucket_name: the primary bucket to benchmark.
-    regional_bucket_name: the secondary bucket to benchmark.
 
   Raises:
     ValueError if an unexpected test outcome is found from the API
     test script.
   """
 
-  buckets = [bucket_name]
-  if regional_bucket_name is not None:
-    buckets.append(regional_bucket_name)
+  one_byte_rw_cmd = command_builder.BuildCommand([
+      '--bucket=%s' % bucket_name,
+      '--scenario=OneByteRW'])
 
-  for bucket in buckets:
-    one_byte_rw_cmd = command_builder.BuildCommand([
-        '--bucket=%s' % bucket,
-        '--scenario=OneByteRW'])
+  _, raw_result = vm.RemoteCommand(one_byte_rw_cmd)
+  logging.info('OneByteRW raw result is %s', raw_result)
 
-    _, raw_result = vm.RemoteCommand(one_byte_rw_cmd)
-    logging.info('OneByteRW raw result is %s', raw_result)
+  for up_and_down in ['upload', 'download']:
+    search_string = 'One byte %s - (.*)' % up_and_down
+    result_string = re.findall(search_string, raw_result)
+    sample_name = ONE_BYTE_LATENCY % up_and_down
 
-    for up_and_down in ['upload', 'download']:
-      search_string = 'One byte %s - (.*)' % up_and_down
-      result_string = re.findall(search_string, raw_result)
-      sample_name = ONE_BYTE_LATENCY % up_and_down
-      if bucket == regional_bucket_name:
-        sample_name = 'regional %s' % sample_name
-
-      if len(result_string) > 0:
-        _JsonStringToPercentileResults(results,
-                                       result_string[0],
-                                       sample_name,
-                                       LATENCY_UNIT,
-                                       metadata)
-      else:
-        raise ValueError('Unexpected test outcome from OneByteRW api test: '
-                         '%s.' % raw_result)
+    if len(result_string) > 0:
+      _JsonStringToPercentileResults(results,
+                                     result_string[0],
+                                     sample_name,
+                                     LATENCY_UNIT,
+                                     metadata)
+    else:
+      raise ValueError('Unexpected test outcome from OneByteRW api test: '
+                       '%s.' % raw_result)
 
 
 def SingleStreamThroughputBenchmark(results, metadata, vm, command_builder,
-                                    service, bucket_name, regional_bucket_name):
+                                    service, bucket_name):
   """A benchmark for large object throughput.
 
   Args:
@@ -630,7 +680,6 @@ def SingleStreamThroughputBenchmark(results, metadata, vm, command_builder,
     command_builder: an APIScriptCommandBuilder.
     service: an ObjectStorageService.
     bucket_name: the primary bucket to benchmark.
-    regional_bucket_name: the secondary bucket to benchmark.
 
   Raises:
     ValueError if an unexpected test outcome is found from the API
@@ -666,7 +715,7 @@ def SingleStreamThroughputBenchmark(results, metadata, vm, command_builder,
 
 
 def ListConsistencyBenchmark(results, metadata, vm, command_builder,
-                             service, bucket_name, regional_bucket_name):
+                             service, bucket_name):
   """A benchmark for bucket list consistency.
 
   Args:
@@ -676,7 +725,6 @@ def ListConsistencyBenchmark(results, metadata, vm, command_builder,
     command_builder: an APIScriptCommandBuilder.
     service: an ObjectStorageService.
     bucket_name: the primary bucket to benchmark.
-    regional_bucket_name: the secondary bucket to benchmark.
 
   Raises:
     ValueError if an unexpected test outcome is found from the API
@@ -762,39 +810,21 @@ def LoadWorkerOutput(output):
   latencies = []
   sizes = []
 
-  prev_stream_num = None
   for worker_out in output:
     json_out = json.loads(worker_out)
-    num_records = len(json_out)
 
-    assert (not prev_stream_num or
-            json_out[0]['stream_num'] == prev_stream_num + 1)
-    prev_stream_num = prev_stream_num + 1 if prev_stream_num else 0
+    for stream in json_out:
+      assert len(stream['start_times']) == len(stream['latencies'])
+      assert len(stream['latencies']) == len(stream['sizes'])
 
-    start_time = np.zeros([num_records], dtype=np.float64)
-    latency = np.zeros([num_records], dtype=np.float64)
-    size = np.zeros([num_records], dtype=np.int64)
-
-    prev_start = None
-    prev_latency = None
-    for i in xrange(num_records):
-      start_time[i] = json_out[i]['start_time']
-      latency[i] = json_out[i]['latency']
-      size[i] = json_out[i]['size']
-
-      assert i == 0 or start_time[i] >= (prev_start + prev_latency)
-      prev_start = start_time[i]
-      prev_latency = latency[i]
-    start_times.append(start_time)
-    latencies.append(latency)
-    sizes.append(size)
+      start_times.append(np.asarray(stream['start_times'], dtype=np.float64))
+      latencies.append(np.asarray(stream['latencies'], dtype=np.float64))
+      sizes.append(np.asarray(stream['sizes'], dtype=np.int64))
 
   return start_times, latencies, sizes
 
 
-def _RunMultiStreamProcesses(vms, command_builder, cmd_args,
-                             streams_per_vm, num_streams):
-
+def _RunMultiStreamProcesses(vms, command_builder, cmd_args, streams_per_vm):
   """Runs all of the multistream read or write processes and doesn't return
      until they complete.
 
@@ -803,26 +833,24 @@ def _RunMultiStreamProcesses(vms, command_builder, cmd_args,
     command_builder: an APIScriptCommandBuilder.
     cmd_args: arguments for the command_builder.
     streams_per_vm: number of threads per vm.
-    num_streams: total number of threads to launch.
   """
 
-  output = [None] * num_streams
+  output = [None] * len(vms)
 
-  def RunOneProcess(proc_idx):
-    vm_idx = proc_idx // streams_per_vm
+  def RunOneProcess(vm_idx):
     logging.info('Running on VM %s.', vm_idx)
     cmd = command_builder.BuildCommand(
-        cmd_args + ['--stream_num_start=%s' % proc_idx])
-    out, _ = vms[vm_idx].RobustRemoteCommand(cmd, should_log=True)
-    output[proc_idx] = out
+        cmd_args + ['--stream_num_start=%s' % (vm_idx * streams_per_vm)])
+    out, _ = vms[vm_idx].RobustRemoteCommand(cmd, should_log=False)
+    output[vm_idx] = out
 
-  # Each process has a thread managing it.
+  # Each vm/process has a thread managing it.
   threads = [
-      threading.Thread(target=RunOneProcess, args=(i,))
-      for i in xrange(num_streams)]
+      threading.Thread(target=RunOneProcess, args=(vm_idx,))
+      for vm_idx in xrange(len(vms))]
   for thread in threads:
     thread.start()
-  logging.info('Started %s processes.', num_streams)
+  logging.info('Started %s processes.', len(vms))
   # Wait for the threads to finish
   for thread in threads:
     thread.join()
@@ -831,8 +859,7 @@ def _RunMultiStreamProcesses(vms, command_builder, cmd_args,
 
 
 def _MultiStreamOneWay(results, metadata, vms, command_builder,
-                       bucket_name, operation):
-
+                       service, bucket_name, operation):
   """Measures multi-stream latency and throughput in one direction.
 
   Args:
@@ -840,7 +867,9 @@ def _MultiStreamOneWay(results, metadata, vms, command_builder,
     metadata: a dictionary of metadata to add to samples.
     vms: the VMs to run the benchmark on.
     command_builder: an APIScriptCommandBuilder.
+    service: The provider's ObjectStorageService
     bucket_name: the primary bucket to benchmark.
+    operation: 'upload' or 'download'
 
   Raises:
     ValueError if an unexpected test outcome is found from the API
@@ -856,7 +885,6 @@ def _MultiStreamOneWay(results, metadata, vms, command_builder,
                FLAGS.object_storage_object_sizes, size_distribution)
 
   streams_per_vm = FLAGS.object_storage_streams_per_vm
-  num_streams = streams_per_vm * len(vms)
 
   start_time = (
       time.time() +
@@ -868,7 +896,7 @@ def _MultiStreamOneWay(results, metadata, vms, command_builder,
       '--bucket=%s' % bucket_name,
       '--objects_per_stream=%s' % (
           FLAGS.object_storage_multistream_objects_per_stream),
-      '--num_streams=1',
+      '--num_streams=%s' % streams_per_vm,
       '--start_time=%s' % start_time,
       '--objects_written_file=%s' % objects_written_file]
 
@@ -884,15 +912,42 @@ def _MultiStreamOneWay(results, metadata, vms, command_builder,
                     'Value is: \'' + operation + '\'')
 
   output = _RunMultiStreamProcesses(vms, command_builder, cmd_args,
-                                    streams_per_vm, num_streams)
+                                    streams_per_vm)
   start_times, latencies, sizes = LoadWorkerOutput(output)
+  if FLAGS.object_storage_worker_output:
+    with open(FLAGS.object_storage_worker_output, 'w') as out_file:
+      out_file.write(json.dumps(output))
   _ProcessMultiStreamResults(start_times, latencies, sizes, operation,
-                             size_distribution.iterkeys(), results,
+                             list(size_distribution.iterkeys()), results,
                              metadata=metadata)
+
+  # Write the objects written file if the flag is set and this is an upload
+  objects_written_path_local = FLAGS.object_storage_objects_written_file
+  if operation == 'upload' and objects_written_path_local is not None:
+    # Get the objects written from all the VMs
+    # Note these are JSON lists with the following format:
+    # [[object1_name, object1_size],[object2_name, object2_size],...]
+    outs = vm_util.RunThreaded(
+        lambda vm: vm.RemoteCommand('cat ' + objects_written_file), vms)
+    maybe_storage_account = ''
+    maybe_resource_group = ''
+    if FLAGS.storage == 'Azure':
+      maybe_storage_account = '"azure_storage_account": "%s", ' % \
+                              service.storage_account.name
+      maybe_resource_group = '"azure_resource_group": "%s", ' % \
+                             service.resource_group.name
+    # Merge the objects written from all the VMs into a single string
+    objects_written_json = \
+        '{%s%s"bucket_name": "%s", "objects_written": %s}' % \
+        (maybe_storage_account, maybe_resource_group, bucket_name,
+         '[' + ','.join([out for out, _ in outs]) + ']')
+    # Write the file
+    with open(objects_written_path_local, 'w') as objects_written_file_local:
+      objects_written_file_local.write(objects_written_json)
 
 
 def MultiStreamRWBenchmark(results, metadata, vms, command_builder,
-                           bucket_name):
+                           service, bucket_name):
 
   """A benchmark for multi-stream read/write latency and throughput.
 
@@ -901,6 +956,7 @@ def MultiStreamRWBenchmark(results, metadata, vms, command_builder,
     metadata: a dictionary of metadata to add to samples.
     vms: the VMs to run the benchmark on.
     command_builder: an APIScriptCommandBuilder.
+    service: The provider's ObjectStorageService
     bucket_name: the primary bucket to benchmark.
 
   Raises:
@@ -910,24 +966,20 @@ def MultiStreamRWBenchmark(results, metadata, vms, command_builder,
 
   logging.info('Starting multi-stream write test on %s VMs.', len(vms))
 
-  _MultiStreamOneWay(results, metadata, vms, command_builder, bucket_name,
-                     'upload')
+  _MultiStreamOneWay(results, metadata, vms, command_builder, service,
+                     bucket_name, 'upload')
 
   logging.info('Finished multi-stream write test. Starting '
                'multi-stream read test.')
 
-  try:
-    _MultiStreamOneWay(results, metadata, vms, command_builder, bucket_name,
-                       'download')
-  except Exception as ex:
-    logging.info('MultiStreamRead test failed with exception %s. Still '
-                 'recording write data.', ex.msg)
+  _MultiStreamOneWay(results, metadata, vms, command_builder, service,
+                     bucket_name, 'download')
 
   logging.info('Finished multi-stream read test.')
 
 
 def MultiStreamWriteBenchmark(results, metadata, vms, command_builder,
-                              bucket_name):
+                              service, bucket_name):
 
   """A benchmark for multi-stream write latency and throughput.
 
@@ -936,6 +988,7 @@ def MultiStreamWriteBenchmark(results, metadata, vms, command_builder,
     metadata: a dictionary of metadata to add to samples.
     vms: the VMs to run the benchmark on.
     command_builder: an APIScriptCommandBuilder.
+    service: The provider's ObjectStorageService
     bucket_name: the primary bucket to benchmark.
 
   Raises:
@@ -945,13 +998,63 @@ def MultiStreamWriteBenchmark(results, metadata, vms, command_builder,
 
   logging.info('Starting multi-stream write test on %s VMs.', len(vms))
 
-  _MultiStreamOneWay(results, metadata, vms, command_builder, bucket_name,
-                     'upload')
+  _MultiStreamOneWay(results, metadata, vms, command_builder, service,
+                     bucket_name, 'upload')
 
   logging.info('Finished multi-stream write test.')
 
 
-def CheckPrerequisites():
+def MultiStreamReadBenchmark(results, metadata, vms, command_builder,
+                             service, bucket_name, read_objects):
+
+  """A benchmark for multi-stream read latency and throughput.
+
+  Args:
+    results: the results array to append to.
+    metadata: a dictionary of metadata to add to samples.
+    vms: the VMs to run the benchmark on.
+    command_builder: an APIScriptCommandBuilder.
+    service: The provider's ObjectStorageService
+    bucket_name: the primary bucket to benchmark.
+    read_objects: List of lists of [object_name, object_size]. In the outermost
+      list, each element corresponds to a VM's worker process.
+
+  Raises:
+    ValueError if an unexpected test outcome is found from the API
+    test script.
+  """
+
+  logging.info('Starting multi-stream read test on %s VMs.', len(vms))
+
+  assert read_objects is not None, \
+      "api_multistream_reads scenario requires the " + \
+      "object_storage_read_objects flag to be set."
+
+  # Send over the objects written file
+  try:
+    # Write the per-VM objects-written-files
+    assert len(read_objects) == len(vms), \
+        "object_storage_read_objects file specified requires exactly %d " \
+        "VMs, but %d were provisioned." % (len(read_objects), len(vms))
+    for vm, vm_objects_written in zip(vms, read_objects):
+      # Note that this overwrites the same local file over and over, because
+      # each VM's worker process expects it to have the same file name.
+      tmp_objects_written_path = os.path.join(temp_dir.GetRunDirPath(),
+                                              OBJECTS_WRITTEN_FILE)
+      with open(tmp_objects_written_path, 'w') as objects_written_file:
+        objects_written_file.write(json.dumps(vm_objects_written))
+      vm.PushFile(tmp_objects_written_path, '/tmp/pkb/')
+  except Exception as e:
+    raise Exception("Failed to upload the objects written files to the VMs: "
+                    "%s" % e)
+
+  _MultiStreamOneWay(results, metadata, vms, command_builder, service,
+                     bucket_name, 'download')
+
+  logging.info('Finished multi-stream read test.')
+
+
+def CheckPrerequisites(benchmark_config):
   """Verifies that the required resources are present.
 
   Raises:
@@ -976,7 +1079,7 @@ def _AppendPercentilesToResults(output_results, input_results, metric_name,
 
 
 def CLIThroughputBenchmark(output_results, metadata, vm, command_builder,
-                           service, bucket, regional_bucket):
+                           service, bucket):
   """A benchmark for CLI tool throughput.
 
   We will upload and download a set of files from/to a local directory
@@ -989,7 +1092,6 @@ def CLIThroughputBenchmark(output_results, metadata, vm, command_builder,
     command_builder: an APIScriptCommandBuilder.
     service: an ObjectStorageService.
     bucket_name: the primary bucket to benchmark.
-    regional_bucket_name: the secondary bucket to benchmark.
 
   Raises:
     NotEnoughResultsError: if we failed too many times to upload or download.
@@ -1104,8 +1206,11 @@ def PrepareVM(vm, service):
     logging.info('Uploading %s to %s', path, vm)
     vm.PushFile(path, '/tmp/run/')
 
+  service.PrepareVM(vm)
 
-def CleanupVM(vm):
+
+def CleanupVM(vm, service):
+  service.CleanupVM(vm)
   vm.RemoteCommand('/usr/bin/yes | sudo pip uninstall python-gflags')
   vm.RemoteCommand('sudo rm -rf /tmp/run/')
   objects_written_file = posixpath.join(vm_util.VM_TMP_DIR,
@@ -1121,44 +1226,64 @@ def Prepare(benchmark_spec):
         required to run the benchmark.
   """
 
-  providers.LoadProvider(FLAGS.storage)
-
-  service = object_storage_service.GetObjectStorageClass(FLAGS.storage)()
-  service.PrepareService(FLAGS.object_storage_region)
-
-  vms = benchmark_spec.vms
-  for vm in vms:
-    PrepareVM(vm, service)
-    service.PrepareVM(vm)
-
   # We would like to always cleanup server side states when exception happens.
   benchmark_spec.always_call_cleanup = True
 
-  # Make the bucket(s)
-  bucket_name = 'pkb%s' % FLAGS.run_uri
-  if FLAGS.storage != 'GCP':
-    service.MakeBucket(bucket_name)
-    buckets = [bucket_name]
+  # Load the objects to read file if specified
+  benchmark_spec.read_objects = None
+  if FLAGS.object_storage_read_objects is not None:
+    with open(FLAGS.object_storage_read_objects) as read_objects_file:
+      # Format of json structure is:
+      # {"bucket_name": <bucket_name>,
+      #  ... any other provider-specific context needed
+      #  "objects_written": <objects_written_array>}
+      benchmark_spec.read_objects = json.loads(read_objects_file.read())
+    assert benchmark_spec.read_objects is not None, \
+        "Failed to read the file specified by --object_storag_read_objects"
+
+  # Load the provider and its object storage service
+  providers.LoadProvider(FLAGS.storage)
+
+  service = object_storage_service.GetObjectStorageClass(FLAGS.storage)()
+  if FLAGS.storage == 'Azure' and FLAGS.object_storage_read_objects is not None:
+    # Storage provider is azure and we are reading existing objects.
+    # Need to prepare the ObjectStorageService with the existing storage
+    # account and resource group associated with the bucket containing our
+    # objects
+    service.PrepareService(
+        FLAGS.object_storage_region,
+        # On Azure, use an existing storage account if we
+        # are reading existing objects
+        (benchmark_spec.read_objects['azure_storage_account'],
+         benchmark_spec.read_objects['azure_resource_group']))
   else:
-    # TODO(nlavine): make GCP bucket name handling match other
-    # providers. Leaving it inconsistent for now to match previous
-    # behavior, but should change it after a reasonable deprecation
-    # period.
-    multiregional_service = gcs.GoogleCloudStorageService()
-    multiregional_service.PrepareService(FLAGS.object_storage_gcs_multiregion
-                                         or DEFAULT_GCS_MULTIREGION)
-    multiregional_service.MakeBucket(bucket_name)
+    service.PrepareService(FLAGS.object_storage_region)
 
-    region = FLAGS.object_storage_region or gcs.DEFAULT_GCP_REGION
-    regional_bucket_name = 'pkb%s-%s' % (FLAGS.run_uri, region)
-    regional_service = gcs.GoogleCloudStorageService()
-    regional_service.PrepareService(region)
-    regional_service.MakeBucket(regional_bucket_name)
-    buckets = [bucket_name, regional_bucket_name]
+  vms = benchmark_spec.vms
+  vm_util.RunThreaded(lambda vm: PrepareVM(vm, service), vms)
 
-  # Save the service and the buckets for later
+  if benchmark_spec.read_objects is not None:
+    # Using an existing bucket
+    bucket_name = benchmark_spec.read_objects['bucket_name']
+    if FLAGS.object_storage_bucket_name is not None:
+      logging.warning('--object_storage_bucket_name ignored because '
+                      '--object_storage_read_objects was specified')
+  else:
+    # Make the bucket(s)
+    bucket_name = FLAGS.object_storage_bucket_name or 'pkb%s' % FLAGS.run_uri
+    if FLAGS.storage == 'GCP' and FLAGS.object_storage_gcs_multiregion:
+      # Use a GCS multiregional bucket
+      multiregional_service = gcs.GoogleCloudStorageService()
+      multiregional_service.PrepareService(FLAGS.object_storage_gcs_multiregion
+                                           or DEFAULT_GCS_MULTIREGION)
+      multiregional_service.MakeBucket(bucket_name)
+    else:
+      # Use a regular bucket
+      service.MakeBucket(bucket_name)
+
+  # Save the service and the bucket name for later
   benchmark_spec.service = service
-  benchmark_spec.buckets = buckets
+  benchmark_spec.bucket_name = bucket_name
 
 
 def Run(benchmark_spec):
@@ -1177,9 +1302,9 @@ def Run(benchmark_spec):
                FLAGS.object_storage_scenario, FLAGS.storage)
 
   service = benchmark_spec.service
-  buckets = benchmark_spec.buckets
+  bucket_name = benchmark_spec.bucket_name
 
-  metadata = {'storage provider': FLAGS.storage}
+  metadata = {'storage_provider': FLAGS.storage}
 
   vms = benchmark_spec.vms
 
@@ -1202,7 +1327,6 @@ def Run(benchmark_spec):
         test_script_path, STORAGE_TO_API_SCRIPT_DICT[FLAGS.storage], service)
   except KeyError:
     command_builder = UnsupportedProviderCommandBuilder(FLAGS.storage)
-  regional_bucket_name = buckets[1] if len(buckets) == 2 else None
 
   for name, benchmark in [('cli', CLIThroughputBenchmark),
                           ('api_data', OneByteRWBenchmark),
@@ -1210,17 +1334,22 @@ def Run(benchmark_spec):
                           ('api_namespace', ListConsistencyBenchmark)]:
     if FLAGS.object_storage_scenario in {name, 'all'}:
       benchmark(results, metadata, vms[0], command_builder,
-                service, buckets[0], regional_bucket_name)
+                service, bucket_name)
 
-  # MultiStreamRW and MultiStreamWrite are the only benchmarks that support
-  # multiple VMs, so they have a slightly different calling convention than the
-  # others.
+  # MultiStreamRW and MultiStreamWrite support multiple VMs, so they have a
+  # slightly different calling convention than the others.
   for name, benchmark in [('api_multistream', MultiStreamRWBenchmark),
                           ('api_multistream_writes',
                            MultiStreamWriteBenchmark)]:
     if FLAGS.object_storage_scenario in {name, 'all'}:
-      benchmark(results, metadata, vms, command_builder, buckets[0])
+      benchmark(results, metadata, vms, command_builder, benchmark_spec.service,
+                bucket_name)
 
+  # MultiStreamRead has the additional 'read_objects' parameter
+  if FLAGS.object_storage_scenario in {'api_multistream_reads', 'all'}:
+    MultiStreamReadBenchmark(results, metadata, vms, command_builder,
+                             benchmark_spec.service, bucket_name,
+                             benchmark_spec.read_objects['objects_written'])
 
   return results
 
@@ -1234,14 +1363,14 @@ def Cleanup(benchmark_spec):
   """
 
   service = benchmark_spec.service
-  buckets = benchmark_spec.buckets
+  bucket_name = benchmark_spec.bucket_name
   vms = benchmark_spec.vms
 
-  for vm in vms:
-    service.CleanupVM(vm)
-    CleanupVM(vm)
+  vm_util.RunThreaded(lambda vm: CleanupVM(vm, service), vms)
 
-  for bucket in buckets:
-    service.DeleteBucket(bucket)
-
-  service.CleanupService()
+  # Only clean up bucket if we're not saving the objects for a later run
+  keep_bucket = FLAGS.object_storage_objects_written_file is not None or \
+      FLAGS.object_storage_dont_delete_bucket
+  if not keep_bucket:
+    service.DeleteBucket(bucket_name)
+    service.CleanupService()

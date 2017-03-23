@@ -1,3 +1,92 @@
+# v1.11.0
+
+External contributions:
+- Add ability to publish to InfluxDB (thanks @besanradwan GH-1278)
+- Always set internal IP-Address on OpenStack VMs (thanks @yremmet GH-1228)
+- Add CloudSuite data-analytics benchmark (thanks @ivonindza GH-1285)
+- Update README.md (thanks @ianmaddox GH-1291)
+- Fix a small typo in the anti-affinity FLAG lookup (thanks @joelio GH-1284)
+- Deprecate flag openstack_volume_size (thanks @vhe182 GH-1220)
+- Add ProfitBricks cloud api v3 support (thanks @aajdinov GH-1264)
+- Enable OpenStack Cinder Volume Type Option (thanks @rossmartyn04 GH-1197)
+
+New features:
+- Add dpb_wordcount_benchmark (GH-1253)
+
+Enhancements:
+- Add helpmatch usage instructions (GH-1268)
+- Add openStack_volume_type option decoder (GH-1267)
+- Upgrade OpenStack CLI dependency to 3.6.0 (GH-1265)
+- Add object storage service cold reads support, various improvements (GH-1290, GH-1274)
+- Add support for AWS Spot Instances (GH-1288)
+- Bump fio version to v2.17 and enable histogram (GH-1300)
+- Let publisher.py republish already-collected samples (GH 1299)
+- Allow specifying temp dir (GH-1277)
+- Add --json_write_mode (GH-1276)
+- Allow override hpcc binaries (GH-1269)
+
+Bug fixes and maintenance updates:
+- Lock samples json file before writing to it (GH-1265)
+- Fixed exception caused by publishers being None (GH-1302)
+- Add error and warning log level options to reduce log size (GH-1301)
+- Use force for DigitalOcean deletes (GH-1281)
+- Print helpmatch usage instructions (GH-1280)
+- Fix fio parser regex (GH-1275)
+- Specify AWS region when calling describe-images (GH 1273)
+- Make CheckPrerequisites more comprehensive (GH-1272)
+- Use image_project flag in disk creation if set (GH-1271)
+- Minor bug fixes and configuration improvements (GH-1262)
+
+
+# v1.10.0
+
+External contributions:
+- Re-write flag_util_test.py so it's easier to read (thanks @yilei GH-1244)
+- Fix bug that prevents running bonnie++ on Azure (thanks @rgodha GH-1218)
+- Add kernel compile benchmark (thanks @maggiejiao GH-1215, GH-1255)
+- Change the documentation to reflect that work should be on master (thanks
+  @besanradwan GH-1209)
+- Add flags to capture latency, bandwidth and IOPS logs in Fio benchmark (thanks @meteorfox GH-1205)
+- Re-add 'vm_util' object to fix broken master branch (thanks @vhe182 GH-1196)
+- Add EPEL Repo to Silo Installation (thanks @akrzos GH-1153)
+
+New features:
+- Add GPU PCIe bandwidth test (GH-1234, GH-1250, GH-1252, GH-1254)
+- Add blazemark (GH-1145)
+- Add simple memcached ycsb benchmark based on aerospike ycsb benchmark (GH-1199)
+- Add scimark2 installation package (GH-1185)
+
+Enhancements:
+- Use FLAGS.aws_user_name if set for Rhel (GH-1249)
+- Fio enhancements (GH-1246)
+- Use aes128-ctr if aes128-cbc isn't available (GH-1242)
+- Make aeropsike able to run with raw devices on static vms (GH-1243)
+- Add some metadata to netperf samples (GH-1236)
+- Remove unneeded Azure code and add availability sets (GH-1232)
+- Add cassandra read concurrency flag (GH-1233)
+- Add a metadata attribute 'ssd_count' to spark_service (GH-1229)
+- Add a metadata attribute 'spark_svc_cloud' to spark_service (GH-1226)
+- Add ability to specify boot_disk_size in AWS vm spec (GH-1231)
+- Add a metadata attribute 'spark_svc_cloud' (GH-1236)
+- Set a default zone for the spark test to allow for subnet creation (GH-1222)
+- Update the location of the spark examples jar on the emr cluster (GH-1222)
+- Persist package installation across reboots (GH-1185)
+- Allow mongodb_ycsb to specify readahead settings (GH-1256)
+
+Bug fixes and maintenance updates:
+- Close Aersospike connection in 1 second (GH-1241)
+- Fix bug with having multiple Azure data disks (GH-1223)
+- Fix aws spark service (GH-1222)
+- Add some git ignore entries (GH-1222)
+- Fix gcs credential conflict (GH-1221)
+- Fix bug with run_processes (GH-1212)
+- Remove collector from RunBenchmarkTask args (GH-1210)
+- Add the minimum tox version to the "tox is not installed" message (GH-1201)
+- Move sysbench05plus path prefix logic into package (GH-1185)
+- Fix bug with specifying Azure image (GH-1204)
+- Fix two files that were failing boilerplate check (GH-1203)
+- Update README.md (GH-1200)
+
 # 1.9.0
 
 New features:
@@ -924,7 +1013,6 @@ Fixes:
 * Fixed corner cases in SPEC 2006 causing it to fail on large instances.
 
 # v0.1
-
 * Support static vms (i.e. machine not provisioned via Cloud APIs. We call all machines VMs). All static VMs provided will be used before any non-static VMs are provisioned.
 * See static_virtual_machine.py for detailed description.
 * Added copy benchmark.

@@ -319,10 +319,15 @@ def RunNetperf(vm, benchmark_name, server_ip, num_streams):
   # Run all of the netperf processes and collect their stdout
   # TODO: Record start times of netperf processes on the remote machine
 
+  # Give the remote script the max possible test length plus 5 minutes to
+  # complete
+  remote_cmd_timeout = \
+      FLAGS.netperf_test_length * (FLAGS.netperf_max_iter or 1) + 300
   remote_script_path = '/tmp/run/%s' % REMOTE_SCRIPT
   remote_cmd = '%s --netperf_cmd="%s" --num_streams=%s --port_start=%s' % \
                (remote_script_path, netperf_cmd, num_streams, PORT_START)
-  remote_stdout, _ = vm.RemoteCommand(remote_cmd)
+  remote_stdout, _ = vm.RemoteCommand(remote_cmd,
+                                      timeout=remote_cmd_timeout)
 
   # Decode stdouts, stderrs, and return codes from remote command's stdout
   stdouts, stderrs, return_codes = json.loads(remote_stdout)
@@ -330,7 +335,7 @@ def RunNetperf(vm, benchmark_name, server_ip, num_streams):
   # Metadata to attach to samples
   metadata = {'netperf_test_length': FLAGS.netperf_test_length,
               'max_iter': FLAGS.netperf_max_iter or 1,
-              'num_streams': num_streams}
+              'sending_thread_count': num_streams}
 
   parsed_output = [_ParseNetperfOutput(stdout, metadata, benchmark_name,
                                        enable_latency_histograms)
@@ -398,15 +403,16 @@ def Run(benchmark_spec):
     A list of sample.Sample objects.
   """
   vms = benchmark_spec.vms
-  client_vm = vms[0]
-  server_vm = vms[1]
+  client_vm = vms[0]  # Client aka "sending vm"
+  server_vm = vms[1]  # Server aka "receiving vm"
   logging.info('netperf running on %s', client_vm)
   results = []
-  metadata = {'ip_type': 'external'}
-  for vm_specifier, vm in ('receiving', server_vm), ('sending', client_vm):
-    metadata['{0}_zone'.format(vm_specifier)] = vm.zone
-    for k, v in vm.GetMachineTypeDict().iteritems():
-      metadata['{0}_{1}'.format(vm_specifier, k)] = v
+  metadata = {
+      'sending_zone': client_vm.zone,
+      'sending_machine_type': client_vm.machine_type,
+      'receiving_zone': server_vm.zone,
+      'receiving_machine_type': server_vm.machine_type
+  }
 
   for num_streams in FLAGS.netperf_num_streams:
     assert(num_streams >= 1)
@@ -416,6 +422,7 @@ def Run(benchmark_spec):
         external_ip_results = RunNetperf(client_vm, netperf_benchmark,
                                          server_vm.ip_address, num_streams)
         for external_ip_result in external_ip_results:
+          external_ip_result.metadata['ip_type'] = 'external'
           external_ip_result.metadata.update(metadata)
         results.extend(external_ip_results)
 

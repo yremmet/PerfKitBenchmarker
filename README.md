@@ -2,8 +2,8 @@ PerfKit Benchmarker
 ==================
 
 PerfKit Benchmarker is an open effort to define a canonical set of benchmarks to measure and compare cloud
-offerings.  It's designed to operate via vendor provided command line tools. The benchmarks are not
-tuned (ie the defaults) because this is what most users will use.  This should help us drive to great defaults.
+offerings.  It's designed to operate via vendor provided command line tools. The benchmark default settings are not
+tuned for any particular platform or instance type. These settings are recommended for consistency across services.
 Only in the rare case where there is a common practice like setting the buffer pool size of a database do we
 change any settings.
 
@@ -709,7 +709,7 @@ OpenStack | nova | |
 CloudStack | QC-1 | |
 Rackspace | IAD | OnMetal machine-types are available only in IAD zone
 Kubernetes | k8s | |
-ProfitBricks | ZONE_1 | Additional zones: ZONE_2
+ProfitBricks | AUTO | Additional zones: ZONE_1, ZONE_2, or ZONE_3
 
 Example:
 
@@ -962,6 +962,21 @@ Flag | Notes
 `--es_uri`         | The Elasticsearch server address and port (e.g. localhost:9200)
 `--es_index`       | The Elasticsearch index name to store documents (default: perfkit)
 `--es_type`        | The Elasticsearch document type (default: result)
+
+Using InfluxDB Publisher
+=================
+No additional packages need to be installed in order to publish Perfkit data to an InfluxDB
+server.
+
+InfluxDB Publisher takes in the flags for the Influx uri and the Influx DB name. The publisher
+will default to the pre-set defaults, identified below, if no uri or DB name is set. However,
+the user is required to at the very least call the `--influx_uri` flag to publish data to Influx.
+
+
+| Flag               | Notes                                                                | Default        |
+|--------------------|----------------------------------------------------------------------|----------------|
+| `--influx_uri`     | The Influx DB address and port. Expects the format hostname:port     | localhost:8086 |
+| `--influx_db_name` | The name of Influx DB database that you wish to publish to or create | perfkit        |
 
 How to Extend PerfKit Benchmarker
 =================
